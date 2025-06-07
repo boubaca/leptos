@@ -307,7 +307,6 @@ impl Owner {
     /// Returns the current `Owner`, if any.
     pub fn current() -> Option<Owner> {
         OWNER.with(|o| {
-            println!("inside current");
             // Use try_borrow to avoid runtime panics
             if let Ok(borrowed) = o.try_borrow() {
                 borrowed.as_ref().and_then(|n| n.upgrade())
