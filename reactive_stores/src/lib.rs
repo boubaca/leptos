@@ -239,6 +239,7 @@
 //! field in the signal inner `Arc<RwLock<_>>`, and tracks the trigger that corresponds with its
 //! path; calling `.write()` returns a writeable guard, and notifies that same trigger.
 
+use or_poisoned::OrPoisoned;
 use reactive_graph::{
     owner::{ArenaItem, LocalStorage, Storage, SyncStorage},
     signal::{
@@ -270,6 +271,10 @@ mod len;
 mod option;
 mod patch;
 mod path;
+#[cfg(feature = "serde")]
+mod serde;
+#[cfg(feature = "slotmap")]
+mod slotmap;
 mod store_field;
 mod subfield;
 
@@ -320,7 +325,7 @@ impl TriggerMap {
 }
 
 /// Manages the keys for a keyed field, including the ability to remove and reuse keys.
-pub(crate) struct FieldKeys<K> {
+pub struct FieldKeys<K> {
     spare_keys: Vec<StorePathSegment>,
     current_key: usize,
     keys: FxHashMap<K, (StorePathSegment, usize)>,
@@ -353,7 +358,15 @@ impl<K> FieldKeys<K>
 where
     K: Hash + PartialEq + Eq,
 {
-    fn get(&self, key: &K) -> Option<(StorePathSegment, usize)> {
+    /// Returns a copy of the path segment to the value identified by the key
+    ///
+    /// # Usage
+    ///
+    /// You shouldn't call this method from your code, since it's a part of
+    /// implementation details of `reactive_stores`. This method was exposed
+    /// to implement the derive `Patch` macro for keyed fields.
+    #[doc(hidden)]
+    pub fn get(&self, key: &K) -> Option<(StorePathSegment, usize)> {
         self.keys.get(key).copied()
     }
 
@@ -414,34 +427,64 @@ impl<K> Default for FieldKeys<K> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-type HashMap<K, V> = Arc<dashmap::DashMap<K, V>>;
-#[cfg(target_arch = "wasm32")]
-type HashMap<K, V> = send_wrapper::SendWrapper<
-    std::rc::Rc<std::cell::RefCell<std::collections::HashMap<K, V>>>,
->;
+type Map<K, V> = Arc<std::sync::RwLock<std::collections::HashMap<K, V>>>;
 
 /// A map of the keys for a keyed subfield.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct KeyMap(
-    HashMap<StorePath, Box<dyn Any + Send + Sync>>,
-    HashMap<(StorePath, usize), StorePathSegment>,
+    /// Path to subfield -> Keys in keyed subfield
+    Map<StorePath, Box<dyn Any + Send + Sync>>,
+    /// Map index -> key
+    Map<(StorePath, usize), StorePathSegment>,
 );
 
-impl Default for KeyMap {
-    fn default() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        return Self(Default::default(), Default::default());
-        #[cfg(target_arch = "wasm32")]
-        return Self(
-            send_wrapper::SendWrapper::new(Default::default()),
-            send_wrapper::SendWrapper::new(Default::default()),
-        );
-    }
-}
-
 impl KeyMap {
-    fn with_field_keys<K, T>(
+    /// Transforms the keys related to the field identified by `path`.
+    ///
+    /// # Arguments
+    ///
+    /// - **path** - path to the field with collection
+    /// - **fun** - Transforms an instance of [FieldKeys] into the result
+    ///   
+    ///   ## Return value
+    ///
+    ///   callback should return a tuple ( result, new_keys)
+    ///
+    ///   - **result** - this value will be passed as a result
+    ///   - **new_keys** - is a vector of new keys to be added into reverse mapping
+    ///     (path, idx) -> (path segment) map
+    ///     
+    ///     ### Entries
+    ///
+    ///     Entry in the vector is a tuple (idx, segment) where
+    ///
+    ///     - **idx** - index of the element in the collection
+    ///     - **segment** - key of the element in the collection
+    ///     
+    /// - **initialize** - it is the set of keys with which to initialize the
+    ///   KeyMap for this field, if there aren't keys listed yet. In all cases
+    ///   inside the library this is `|| self.latest_keys()` or `|| self.inner.latest_keys()`
+    ///
+    ///   This function will be called **only** if KeyMap doesn't have entry for
+    ///   `path`.
+    ///
+    ///   ## Returns
+    ///
+    ///   A vector of keys which will be used if KeyMap doesn't have an entry for
+    ///   given `path`
+    ///
+    /// # Returns
+    ///
+    /// - [None] if path doesn't point to the keyed field
+    /// - **result** value returned from `fun` callback
+    ///
+    /// # Usage
+    ///
+    /// You should not call this method directly from your code, as it's
+    /// an implementation detail of `reactive_stores`. This method was exposed
+    /// to implement the derive `Patch` macro for keyed fields.
+    #[doc(hidden)]
+    pub fn with_field_keys<K, T>(
         &self,
         path: StorePath,
         fun: impl FnOnce(&mut FieldKeys<K>) -> (T, Vec<(usize, StorePathSegment)>),
@@ -450,64 +493,33 @@ impl KeyMap {
     where
         K: Debug + Hash + PartialEq + Eq + Send + Sync + 'static,
     {
-        let initial_keys = initialize();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut entry = self
-            .0
+        let mut guard = self.0.write().or_poisoned();
+        let entry = guard
             .entry(path.clone())
-            .or_insert_with(|| Box::new(FieldKeys::new(initial_keys)));
-
-        #[cfg(target_arch = "wasm32")]
-        let entry = if !self.0.borrow().contains_key(&path) {
-            Some(Box::new(FieldKeys::new(initial_keys)))
-        } else {
-            None
-        };
-        #[cfg(target_arch = "wasm32")]
-        let mut map = self.0.borrow_mut();
-        #[cfg(target_arch = "wasm32")]
-        let entry = map.entry(path.clone()).or_insert_with(|| entry.unwrap());
+            .or_insert_with(|| Box::new(FieldKeys::new(initialize())));
 
         let entry = entry.downcast_mut::<FieldKeys<K>>()?;
         let (result, new_keys) = fun(entry);
         if !new_keys.is_empty() {
             for (idx, segment) in new_keys {
-                #[cfg(not(target_arch = "wasm32"))]
-                self.1.insert((path.clone(), idx), segment);
-
-                #[cfg(target_arch = "wasm32")]
-                self.1.borrow_mut().insert((path.clone(), idx), segment);
+                self.1
+                    .write()
+                    .or_poisoned()
+                    .insert((path.clone(), idx), segment);
             }
         }
         Some(result)
     }
 
     fn contains_key(&self, key: &StorePath) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.0.contains_key(key)
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.0.borrow_mut().contains_key(key)
-        }
+        self.0.read().or_poisoned().contains_key(key)
     }
 
     fn get_key_for_index(
         &self,
         key: &(StorePath, usize),
     ) -> Option<StorePathSegment> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.1.get(key).as_deref().copied()
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.1.borrow().get(key).as_deref().copied()
-        }
+        self.1.read().or_poisoned().get(key).copied()
     }
 }
 
